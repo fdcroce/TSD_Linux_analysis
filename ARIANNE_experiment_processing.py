@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import pickle
 import argparse
 from itertools import product
@@ -16,6 +17,7 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
 
 
+sys.path.append(r"\\sckstor9\NMS_DATA\VENUS-F\Knowledge\PhD\DiCroceFederico\PROCESSING")
 from DetectorSetup_utils import DetectorChannel, ExperimentSetup
 import TID_analysis as tid
 import TimeStampData_hdf5 as tsd
@@ -115,6 +117,7 @@ def plot_countrate_evolution(countrate: pd.Series, channel=None, ax=None):
 
     return ax
 
+
 def plot_tid_full_and_closeup(
     tid_,
     popt,
@@ -126,8 +129,8 @@ def plot_tid_full_and_closeup(
 ):
     """
     Plots a 2-column comparison of the single-channel TID PDF:
-      - Left:  Full inter-arrival time distribution
-      - Right: Close-up up to x_max = 3 * (tau_1 + tau_2) with right-aligned y-axis
+- Left:  Full inter-arrival time distribution
+- Right: Close-up up to x_max = 3 * (tau_1 + tau_2) with right-aligned y-axis
     """
     popt = np.asarray(popt, dtype=float)
 
@@ -171,7 +174,6 @@ def plot_tid_full_and_closeup(
     raw_events = tid.generate_poisson_events(popt[0], sim_duration)
     recorded_events = simulate_chain(raw_events, arrangement, popt)
     intervals = np.diff(recorded_events)
-    
 
     bin_width = dt_emp if (np.isfinite(dt_emp) and dt_emp > 0) else max(xlim_closeup / 150.0, 1e-8)
     bin_edges = np.arange(0, intervals.max() + bin_width, bin_width)
@@ -282,6 +284,7 @@ def plot_tid_full_and_closeup(
         plt.tight_layout()
 
     return axes
+
 
 def plot_tid_closeup(
     tid_,
@@ -484,30 +487,48 @@ def main(
     n_exp: int = 1,
     rossi_min_interval: float = 50e-6,
 ) -> None:
+    t_pipeline_start = time.perf_counter()
+    print(f"[TIME] Numba threads available: {tsd.numba.get_num_threads()}")
+
     in_path = Path(file_in).expanduser().resolve()
     if not in_path.exists():
         raise FileNotFoundError(f"Input file not found: '{in_path}'")
 
+    t_step = time.perf_counter()
     if in_path.suffix.lower() in {".h5", ".hdf5"}:
         h5_path = in_path
+        print(f"[TIME] Using existing HDF5 file: {h5_path} (0.00 s)")
     else:
         h5_path = in_path.with_suffix(".h5")
         if overwrite_h5 or not h5_path.exists():
+            print(f"[TIME] Step 1 (BIN -> HDF5 conversion): starting...")
             tsd.convert_bin_to_hdf5(str(in_path), str(h5_path))
+            print(f"[TIME] Step 1 (BIN -> HDF5 conversion): {time.perf_counter() - t_step:.2f} s")
         else:
-            print(f"HDF5 file already exists, loading directly: {h5_path}")
+            print(f"[TIME] Step 1 (HDF5 already exists, skipped conversion): {time.perf_counter() - t_step:.2f} s — {h5_path}")
 
     # --------------------------------------------------------
     # A. Compute Count Rate and TID per active channel
     # --------------------------------------------------------
+    t_step_a = time.perf_counter()
     results = {}
     with tsd.HDF5TimestampData(str(h5_path)) as data:
         for ch_id, ch_handle in data.channels.items():
-            print(f"Processing channel {ch_id} ({len(ch_handle):,} events)...")
+            print(f"\nProcessing channel {ch_id} ({len(ch_handle):,} events)...")
+
+            t_cr = time.perf_counter()
+            cr_series = ch_handle.count_rate(bin_size_seconds=bin_size_seconds)
+            print(f"[TIME]   Ch {ch_id} count_rate: {time.perf_counter() - t_cr:.2f} s")
+
+            t_tid = time.perf_counter()
+            tid_series = ch_handle.time_interval_distribution(max_delta_ticks=5000, coarser_grouping=1)
+            print(f"[TIME]   Ch {ch_id} time_interval_distribution: {time.perf_counter() - t_tid:.2f} s")
+
             results[ch_id] = {
-                "countrate": ch_handle.count_rate(bin_size_seconds=bin_size_seconds),
-                "tid": ch_handle.time_interval_distribution(max_delta_ticks=5000, coarser_grouping=1),
+                "countrate": cr_series,
+                "tid": tid_series,
             }
+    print(f"[TIME] Step 2A (All channels count_rate + TID): {time.perf_counter() - t_step_a:.2f} s")
 
     if not results:
         print(f"No channels found in {h5_path}. Exiting.")
@@ -537,12 +558,15 @@ def main(
     # --------------------------------------------------------
     # B. Per-channel Count Rate & Dead-Time (TID) Analysis
     # --------------------------------------------------------
+    t_step_b = time.perf_counter()
     for ch_id in suitable_channels:
+        t_ch = time.perf_counter()
         suffix = f"_ch{ch_id}" if multichannel_acquisition else ""
         ch_label = ch_id if multichannel_acquisition else None
         print(f"\n--- Analyzing {f'Channel {ch_id}' if multichannel_acquisition else 'Single Channel'} ---")
 
         # 1. Count rate evolution
+        t_sub = time.perf_counter()
         print("Saving and plotting count rate evolution...")
         countrate = results[ch_id]["countrate"]
         countrate.to_csv(out_path / f"countrate{suffix}.csv")
@@ -552,14 +576,18 @@ def main(
         fig_cr.tight_layout()
         fig_cr.savefig(out_path / f"countrate{suffix}.png", bbox_inches="tight")
         plt.close(fig_cr)
+        print(f"[TIME]   Ch {ch_id} count-rate save & plot: {time.perf_counter() - t_sub:.2f} s")
 
         # 2. Time Interval Distribution (TID)
+        t_sub = time.perf_counter()
         print("Saving TID...")
         tid_ = results[ch_id]["tid"].to_frame().reset_index(names="interval")
         tid_["interval"] = tid_["interval"] * 1e-8  # Convert 10 ns ticks to seconds
         tid_.to_csv(out_path / f"tid{suffix}.csv", index=False)
+        print(f"[TIME]   Ch {ch_id} TID CSV save: {time.perf_counter() - t_sub:.2f} s")
 
         # 3. Dead-time histogram fitting
+        t_sub = time.perf_counter()
         print(f"Fitting TID with a {dt_structure} deadtime model...")
         dt_tick_sec = tid_["interval"].diff().mean()
         p0 = (
@@ -577,15 +605,18 @@ def main(
 
         with open(out_path / f"tid_fitting{suffix}.pkl", "wb") as f:
             pickle.dump(tid_fitting, f)
+        print(f"[TIME]   Ch {ch_id} TID fit & pickle: {time.perf_counter() - t_sub:.2f} s")
 
         # 4. Close-up dead-time plot
+        t_sub = time.perf_counter()
         print("Plotting TID distribution and estimated deadtime constants...")
         recorded_duration = float(countrate.index.max() - countrate.index.min())
-        
-        fig_tid, axes_tid = plt.subplots(1,2,figsize=(13.5, 4.8),dpi=200,
-                                         sharex=False,
-                                         sharey=False,
-                                         gridspec_kw={"width_ratios": [2, 1]},)
+
+        fig_tid, axes_tid = plt.subplots(
+            1, 2, figsize=(13.5, 4.8), dpi=200,
+            sharex=False, sharey=False,
+            gridspec_kw={"width_ratios": [2, 1]},
+        )
         plot_tid_full_and_closeup(
             tid_,
             tid_fitting["popt"],
@@ -594,7 +625,6 @@ def main(
             duration=recorded_duration,
             axes=axes_tid,
         )
-        
         fig_tid.tight_layout()
         fig_tid.savefig(out_path / f"tid_dtc{suffix}.png", bbox_inches="tight")
         plt.close(fig_tid)
@@ -611,20 +641,27 @@ def main(
         fig_tid.tight_layout()
         fig_tid.savefig(out_path / f"tid_closeup_dtc{suffix}.png", bbox_inches="tight")
         plt.close(fig_tid)
+        print(f"[TIME]   Ch {ch_id} TID plots (full + closeup): {time.perf_counter() - t_sub:.2f} s")
+        print(f"[TIME]   Ch {ch_id} total Step 2B time: {time.perf_counter() - t_ch:.2f} s")
+
+    print(f"[TIME] Step 2B (All channels post-processing/fitting/plotting): {time.perf_counter() - t_step_b:.2f} s")
 
     # --------------------------------------------------------
     # C. Rossi-Alpha Distribution Computation & Fitting
     # --------------------------------------------------------
     print("\n--- Computing Rossi-Alpha Distributions ---")
+    t_step_c = time.perf_counter()
     gates_sec = np.array([10, 50, 100, 200, 500, 1000, 2000, 5000, 10000]) * 1e-6
     rossi = {}
 
     with tsd.HDF5TimestampData(str(h5_path)) as data:
         if len(suitable_channels) > 1:
             for ch_id, ch_tr in product(suitable_channels, repeat=2):
+                t_pair = time.perf_counter()
                 print(f"Computing Rossi-alpha: signal Ch {ch_id}, trigger Ch {ch_tr}...")
                 data_id = data.channels[ch_id]
                 for g in gates_sec:
+                    t_g = time.perf_counter()
                     if ch_id == ch_tr:
                         rossi[(g, ch_id, ch_tr)] = data_id.rossi_alpha(
                             h5_trigger=None, gate=g, coarser_grouping=1
@@ -634,20 +671,29 @@ def main(
                         rossi[(g, ch_id, ch_tr)] = data_id.rossi_alpha(
                             h5_trigger=data_tr, gate=g, coarser_grouping=1
                         )
+                    print(f"[TIME]     gate={g*1e6:.0f} us (sig={ch_id}, trig={ch_tr}): {time.perf_counter() - t_g:.2f} s")
+                print(f"[TIME]   Pair (sig={ch_id}, trig={ch_tr}) all gates: {time.perf_counter() - t_pair:.2f} s")
         else:
             only_ch = suitable_channels[0]
             print(f"Computing Rossi-alpha (auto-correlation) for Ch {only_ch}...")
             data_id = data.channels[only_ch]
             for g in gates_sec:
+                t_g = time.perf_counter()
                 rossi[(g, only_ch, only_ch)] = data_id.rossi_alpha(
                     h5_trigger=None, gate=g, coarser_grouping=1
                 )
+                print(f"[TIME]     gate={g*1e6:.0f} us (ch={only_ch}): {time.perf_counter() - t_g:.2f} s")
 
+    print(f"[TIME] Step 2C-1 (All Rossi-Alpha computations): {time.perf_counter() - t_step_c:.2f} s")
+
+    t_pkl = time.perf_counter()
     with open(out_path / "rossialpha_data.pkl", "wb") as f:
         pickle.dump(rossi, f)
+    print(f"[TIME] Saving rossialpha_data.pkl: {time.perf_counter() - t_pkl:.2f} s")
 
     # Fit and plot each Rossi-alpha distribution
     print("Fitting and plotting Rossi-alpha distributions...")
+    t_fit_plot = time.perf_counter()
     rossi_plots_dir = out_path / "rossi_alpha_plots"
     rossi_plots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -729,7 +775,9 @@ def main(
     with open(out_path / "rossi_alpha_fitting.pkl", "wb") as f:
         pickle.dump(fit_results, f)
 
-    print(f"\nProcessing complete. Outputs saved to '{out_path}'.")
+    print(f"[TIME] Step 2C-2 (All Rossi-Alpha fits & plots): {time.perf_counter() - t_fit_plot:.2f} s")
+    print(f"\n[TIME] TOTAL PIPELINE RUNTIME: {time.perf_counter() - t_pipeline_start:.2f} s")
+    print(f"Processing complete. Outputs saved to '{out_path}'.")
 
 
 # ============================================================
@@ -798,6 +846,8 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.lib_dir:
+        sys.path.insert(0, str(Path(args.lib_dir).expanduser().resolve()))
     main(
         file_in=args.file_in,
         dt_structure=args.dt_structure,
@@ -808,10 +858,3 @@ if __name__ == "__main__":
         n_exp=args.n_exp,
         rossi_min_interval=args.rossi_min_interval,
     )
-
-
-
-
-
-
-
