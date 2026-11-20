@@ -1,0 +1,40 @@
+name: Build Portable Linux Python Env
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-env:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Miniforge and packages into python_env
+        run: |
+          curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+          bash Miniforge3-Linux-x86_64.sh -b -p "$PWD/bundle/python_env"
+          "$PWD/bundle/python_env/bin/conda" install -y numpy pandas scipy matplotlib pytables numba
+          "$PWD/bundle/python_env/bin/python" -c "import numpy, pandas, scipy, matplotlib, tables, numba; print('ENV OK')"
+
+      - name: Copy scripts and create run_analysis.sh
+        run: |
+          cp ARIANNE_experiment_processing.py TID_analysis.py TimeStampData_hdf5.py DetectorSetup_utils.py "$PWD/bundle/"
+          cat <<'EOF' > "$PWD/bundle/run_analysis.sh"
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          PY_BIN="$SCRIPT_DIR/python_env/bin/python"
+          if [ "$#" -lt 1 ]; then
+            echo "Usage: bash run_analysis.sh <input_file> [options...]"
+            exit 1
+          fi
+          exec "$PY_BIN" "$SCRIPT_DIR/ARIANNE_experiment_processing.py" "$@"
+          EOF
+          tar -czf arianne_linux_portable.tar.gz -C "$PWD/bundle" .
+
+      - name: Upload portable Linux bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arianne-linux-portable
+          path: arianne_linux_portable.tar.gz
