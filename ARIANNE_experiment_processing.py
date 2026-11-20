@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
 
 
+sys.path.append(r"\\sckstor9\NMS_DATA\VENUS-F\Knowledge\PhD\DiCroceFederico\PROCESSING")
 from DetectorSetup_utils import DetectorChannel, ExperimentSetup
 import TID_analysis as tid
 import TimeStampData_hdf5 as tsd
@@ -116,6 +117,173 @@ def plot_countrate_evolution(countrate: pd.Series, channel=None, ax=None):
 
     return ax
 
+def plot_tid_full_and_closeup(
+    tid_,
+    popt,
+    arrangement: str = "NE-E",
+    channel=None,
+    duration: float = None,
+    axes=None,
+    logy_full: bool = False,
+):
+    """
+    Plots a 2-column comparison of the single-channel TID PDF:
+      - Left:  Full inter-arrival time distribution
+      - Right: Close-up up to x_max = 3 * (tau_1 + tau_2) with right-aligned y-axis
+    """
+    popt = np.asarray(popt, dtype=float)
+
+    # 1. Prepare empirical DataFrame
+    if isinstance(tid_, pd.Series):
+        df = pd.DataFrame({
+            "interval": tid_.index.to_numpy(dtype=float),
+            "time_interval_distribution": tid_.to_numpy(dtype=float),
+        })
+    else:
+        df = tid_.copy()
+        if "channel" in df.columns:
+            if channel is None:
+                unique_chs = df["channel"].unique()
+                if len(unique_chs) > 1:
+                    raise ValueError(
+                        f"`tid_` contains multiple channels ({list(unique_chs)}). Pass `channel=...`."
+                    )
+                channel = unique_chs[0]
+            df = df[df["channel"] == channel].copy()
+
+    df = df.sort_values("interval").reset_index(drop=True)
+
+    has_two_taus = len(popt) > 2 and popt[2] is not None and not np.isnan(popt[2])
+    total_tau = popt[1] + popt[2] if has_two_taus else popt[1]
+    xlim_closeup = 3.0 * total_tau
+
+    dt_emp = np.median(np.diff(np.sort(df["interval"].unique())))
+    total_counts = df["time_interval_distribution"].sum()
+    df["pdf"] = df["time_interval_distribution"] / (total_counts * dt_emp)
+
+    # 2. Run Monte Carlo simulation once for both panels (cap duration to avoid MemoryError)
+    if duration is None:
+        duration = max(total_counts / popt[0], 1.0)
+
+    max_raw_events = 2_000_000
+    max_sim_duration = max_raw_events / max(float(popt[0]), 1.0)
+    sim_duration = min(float(duration), max_sim_duration, 30.0)
+    sim_duration = max(sim_duration, 0.1)
+
+    raw_events = tid.generate_poisson_events(popt[0], sim_duration)
+    recorded_events = simulate_chain(raw_events, arrangement, popt)
+    intervals = np.diff(recorded_events)
+    
+
+    bin_width = dt_emp if (np.isfinite(dt_emp) and dt_emp > 0) else max(xlim_closeup / 150.0, 1e-8)
+    bin_edges = np.arange(0, intervals.max() + bin_width, bin_width)
+    counts, edges = np.histogram(intervals, bins=bin_edges, density=True)
+
+    # 3. Create 1x2 subplots (independent x and y axes)
+    created_fig = axes is None
+    if created_fig:
+        fig, axes = plt.subplots(
+            1, 2,
+            dpi=200,
+            figsize=(13.5, 4.8),
+            sharex=False,
+            sharey=False,
+        )
+    ax_full, ax_zoom = axes
+
+    xlim_full = max(df["interval"].max(), intervals.max())
+
+    # Helper to draw shared curves & dead-time markers on both axes
+    def _plot_layers(ax, x_upper, n_grid):
+        df_sub = df[df["interval"] <= x_upper]
+        ax.step(
+            df_sub["interval"],
+            df_sub["pdf"],
+            where="post",
+            alpha=0.75,
+            color="steelblue",
+            lw=1.3,
+            label="Empirical",
+        )
+
+        mask = edges[:-1] <= x_upper
+        ax.step(
+            edges[:-1][mask],
+            counts[mask],
+            where="post",
+            color="crimson",
+            lw=1.2,
+            label=f"Reconstructed ({arrangement})",
+        )
+
+        t_grid = np.linspace(0, x_upper, n_grid)
+        ax.plot(
+            t_grid,
+            tid.evaluate_series_tid(t_grid, arrangement, *popt),
+            "k--",
+            lw=1.4,
+            label=f"Analytical ({arrangement})",
+        )
+
+        ax.axvline(
+            popt[1],
+            color="darkorange",
+            ls=":",
+            lw=1.6,
+            label=rf"$\tau_1$ = {popt[1]*1e6:.2f} $\mu$s",
+        )
+        if has_two_taus:
+            ax.axvline(
+                popt[1] + popt[2],
+                color="seagreen",
+                ls="-.",
+                lw=1.6,
+                label=rf"$\tau_1 + \tau_2$ = {(popt[1] + popt[2])*1e6:.2f} $\mu$s",
+            )
+
+    # --- Left Panel: Full Distribution ---
+    _plot_layers(ax_full, xlim_full, n_grid=1000)
+    ax_full.set_xlim(0, xlim_full)
+    if logy_full:
+        ax_full.set_yscale("log")
+    ax_full.set_xlabel("Inter-arrival Time $t$ (s)")
+    ax_full.set_ylabel(r"Probability Density ($\mathrm{s}^{-1}$)")
+    ax_full.set_title("Full Distribution")
+    ax_full.legend(loc="upper right", frameon=True)
+    ax_full.grid(True, alpha=0.25)
+
+    # --- Right Panel: Close-Up (y-axis on the right) ---
+    _plot_layers(ax_zoom, xlim_closeup, n_grid=500)
+    ax_zoom.set_xlim(0, xlim_closeup)
+    ax_zoom.yaxis.tick_right()
+    ax_zoom.yaxis.set_label_position("right")
+    ax_zoom.set_xlabel("Inter-arrival Time $t$ (s)")
+    ax_zoom.set_ylabel(r"Probability Density ($\mathrm{s}^{-1}$)")
+
+    tau_formula = r"3(\tau_1 + \tau_2)" if has_two_taus else r"3\tau_1"
+    ax_zoom.set_title(rf"Dead-Time Close-Up ($0$ to ${tau_formula} = {xlim_closeup*1e6:.2f}\,\mu\mathrm{{s}}$)")
+    ax_zoom.grid(True, alpha=0.25)
+
+    # Parameter box placed neatly in upper right of close-up (since legend is on the left)
+    param_names = [r"\lambda", r"\tau_1", r"\tau_2"] if has_two_taus else [r"\lambda", r"\tau_1"]
+    param_label = "\n".join(fr"${name}$ = {val:.3e}" for name, val in zip(param_names, popt))
+    ax_zoom.text(
+        0.97,
+        0.95,
+        param_label,
+        transform=ax_zoom.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8.5,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="lightgray", alpha=0.9),
+    )
+
+    if created_fig:
+        if channel is not None:
+            fig.suptitle(f"Channel {channel} — Time Interval Distribution ({arrangement})", y=1.02)
+        plt.tight_layout()
+
+    return axes
 
 def plot_tid_closeup(
     tid_,
@@ -173,10 +341,16 @@ def plot_tid_closeup(
         label="Empirical",
     )
 
+    # 2. Run Monte Carlo simulation once for both panels (cap duration to avoid MemoryError)
     if duration is None:
         duration = max(total_counts / popt[0], 1.0)
 
-    raw_events = tid.generate_poisson_events(popt[0], duration)
+    max_raw_events = 2_000_000
+    max_sim_duration = max_raw_events / max(float(popt[0]), 1.0)
+    sim_duration = min(float(duration), max_sim_duration, 30.0)
+    sim_duration = max(sim_duration, 0.1)
+
+    raw_events = tid.generate_poisson_events(popt[0], sim_duration)
     recorded_events = simulate_chain(raw_events, arrangement, popt)
     intervals = np.diff(recorded_events)
 
@@ -383,7 +557,7 @@ def main(
 
         # 2. Time Interval Distribution (TID)
         print("Saving TID...")
-        tid_ = results[ch_id]["tid"].reset_index(names="interval")
+        tid_ = results[ch_id]["tid"].to_frame().reset_index(names="interval")
         tid_["interval"] = tid_["interval"] * 1e-8  # Convert 10 ns ticks to seconds
         tid_.to_csv(out_path / f"tid{suffix}.csv", index=False)
 
@@ -409,6 +583,24 @@ def main(
         # 4. Close-up dead-time plot
         print("Plotting TID distribution and estimated deadtime constants...")
         recorded_duration = float(countrate.index.max() - countrate.index.min())
+        
+        fig_tid, axes_tid = plt.subplots(1,2,figsize=(13.5, 4.8),dpi=200,
+                                         sharex=False,
+                                         sharey=False,
+                                         gridspec_kw={"width_ratios": [2, 1]},)
+        plot_tid_full_and_closeup(
+            tid_,
+            tid_fitting["popt"],
+            arrangement=dt_structure,
+            channel=ch_label,
+            duration=recorded_duration,
+            axes=axes_tid,
+        )
+        
+        fig_tid.tight_layout()
+        fig_tid.savefig(out_path / f"tid_dtc{suffix}.png", bbox_inches="tight")
+        plt.close(fig_tid)
+
         fig_tid, ax_tid = plt.subplots(dpi=200, figsize=(7.5, 4.8))
         plot_tid_closeup(
             tid_,
@@ -419,7 +611,7 @@ def main(
             ax=ax_tid,
         )
         fig_tid.tight_layout()
-        fig_tid.savefig(out_path / f"tid_dtc{suffix}.png", bbox_inches="tight")
+        fig_tid.savefig(out_path / f"tid_closeup_dtc{suffix}.png", bbox_inches="tight")
         plt.close(fig_tid)
 
     # --------------------------------------------------------
@@ -548,7 +740,7 @@ def main(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Windows CAEN timestamp conversion & Count Rate + TID + Rossi-alpha analysis."
+        description="Cross-platform (Windows/Linux) CAEN timestamp conversion & Count Rate + TID + Rossi-alpha analysis."
     )
     parser.add_argument(
         "file_in",
