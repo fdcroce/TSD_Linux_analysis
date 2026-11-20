@@ -16,11 +16,9 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
 
 
-sys.path.append(r"\\sckstor9\NMS_DATA\VENUS-F\Knowledge\PhD\DiCroceFederico\PROCESSING")
 from DetectorSetup_utils import DetectorChannel, ExperimentSetup
 import TID_analysis as tid
 import TimeStampData_hdf5 as tsd
-
 
 
 # ============================================================
