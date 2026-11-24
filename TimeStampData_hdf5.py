@@ -9,6 +9,9 @@ import pandas as pd
 from scipy.optimize import curve_fit
 import tables as tb
 
+_UINT64_MAX = np.uint64(np.iinfo(np.uint64).max)
+_UINT64_MAX_LITERAL = np.uint64(0xFFFFFFFFFFFFFFFF)
+
 
 # ============================================================
 # 1. LOW-LEVEL NUMBA KERNELS (CACHE-SAFE, ZERO-COPY, THREAD-ISOLATED)
@@ -230,6 +233,7 @@ def _rossi_alpha_cross_core(
     start_bound = np.uint64(start_tick)
     gate_bound = np.uint64(gate_ticks)
     group = np.uint64(coarser_grouping)
+    u64_max = np.uint64(0xFFFFFFFFFFFFFFFF)
 
     for tid in prange(n_threads):
         for i in range(tid, n_trig, n_threads):
@@ -237,7 +241,7 @@ def _rossi_alpha_cross_core(
                 continue
 
             t_trigger = trigger_tags[i]
-            target = t_trigger + start_bound if (np.uint64(-1) - t_trigger) >= start_bound else np.uint64(-1)
+            target = t_trigger + start_bound if (u64_max - t_trigger) >= start_bound else u64_max
 
             lo = 0
             hi = n_resp
@@ -651,10 +655,10 @@ def compute_rossi_alpha(
 ) -> pd.Series:
     """
     Computes triggered forward-window Rossi-Alpha distribution:
-      - `h5_trigger is None`: auto-correlation on `h5_channel` over `[start_idx, stop_idx)`.
-      - `h5_trigger is not None`: cross-correlation triggering on `h5_trigger` over
-        `[trigger_start_idx, trigger_stop_idx)` against follower events in `h5_channel`
-        over `[start_idx, stop_idx)`.
+    - `h5_trigger is None`: auto-correlation on `h5_channel` over `[start_idx, stop_idx)`.
+    - `h5_trigger is not None`: cross-correlation triggering on `h5_trigger` over
+      `[trigger_start_idx, trigger_stop_idx)` against follower events in `h5_channel`
+      over `[start_idx, stop_idx)`.
 
     Returns a `pd.Series` indexed by time lag in seconds.
     """
@@ -693,7 +697,7 @@ def compute_rossi_alpha(
             active_elements = int(chunk_tags.size)
 
             last_t = np.uint64(chunk_tags[-1])
-            cutoff_tick = last_t + gate_ticks_u64 if (np.uint64(-1) - last_t) >= gate_ticks_u64 else np.uint64(-1)
+            cutoff_tick = last_t + gate_ticks_u64 if (_UINT64_MAX - last_t) >= gate_ticks_u64 else _UINT64_MAX
 
             pad_start = end
             pad_blocks = []
@@ -749,7 +753,7 @@ def compute_rossi_alpha(
 
             t_min = np.uint64(trig_tags[0])
             last_trig = np.uint64(trig_tags[-1])
-            t_max = last_trig + gate_ticks_u64 if (np.uint64(-1) - last_trig) >= gate_ticks_u64 else np.uint64(-1)
+            t_max = last_trig + gate_ticks_u64 if (_UINT64_MAX - last_trig) >= gate_ticks_u64 else _UINT64_MAX
 
             resp_lo = _binary_search_timetag(resp_table, int(t_min), r_s0, r_s1, side="left")
             resp_hi = _binary_search_timetag(resp_table, int(t_max), resp_lo, r_s1, side="right")
@@ -956,10 +960,9 @@ class HDF5ChannelHandle:
             **kwargs,
         )
 
-    def rossi_alpha(self, trigger=None, **kwargs) -> pd.Series:
+    def rossi_alpha(self, **kwargs) -> pd.Series:
         return compute_rossi_alpha(
             self.table,
-            h5_trigger=trigger,
             start_idx=self.start_idx,
             stop_idx=self.stop_idx,
             **kwargs,

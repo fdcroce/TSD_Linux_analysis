@@ -17,7 +17,20 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
 
 
-sys.path.append(r"\\sckstor9\NMS_DATA\VENUS-F\Knowledge\PhD\DiCroceFederico\PROCESSING")
+def _bootstrap_lib_path() -> None:
+    """Adds --lib-dir (if passed via CLI) or default network path before local imports."""
+    for i, arg in enumerate(sys.argv[1:], start=1):
+        if arg == "--lib-dir" and i + 1 < len(sys.argv):
+            sys.path.insert(0, str(Path(sys.argv[i + 1]).expanduser().resolve()))
+            return
+        if arg.startswith("--lib-dir="):
+            sys.path.insert(0, str(Path(arg.split("=", 1)[1]).expanduser().resolve()))
+            return
+    sys.path.append(r"\\sckstor9\NMS_DATA\VENUS-F\Knowledge\PhD\DiCroceFederico\PROCESSING")
+
+
+_bootstrap_lib_path()
+
 from DetectorSetup_utils import DetectorChannel, ExperimentSetup
 import TID_analysis as tid
 import TimeStampData_hdf5 as tsd
@@ -43,6 +56,28 @@ def simulate_chain(events: np.ndarray, arrangement: str, popt: np.ndarray) -> np
     if arr == "E-E":
         return tid.apply_paralyzable(tid.apply_paralyzable(events, popt[1]), popt[2])
     raise ValueError(f"Unknown dead-time arrangement: '{arrangement}'")
+
+
+def slice_rossi_gate(
+    ra_max: pd.Series,
+    gate_sec: float,
+    coarser_grouping: int = 1,
+) -> pd.Series:
+    """
+    Extracts a shorter gate (and optional coarser rebinning) from a precomputed
+    max-gate Rossi-alpha Series in memory without re-reading the HDF5 file.
+    """
+    sub = ra_max[ra_max.index < gate_sec - 1e-13]
+
+    if coarser_grouping > 1:
+        n_coarse = len(sub) // coarser_grouping
+        trimmed = sub.iloc[: n_coarse * coarser_grouping]
+        new_index = trimmed.index.to_numpy()[::coarser_grouping]
+        new_counts = trimmed.to_numpy().reshape(n_coarse, coarser_grouping).sum(axis=1)
+        sub = pd.Series(new_counts, index=new_index, name=ra_max.name)
+        sub.index.name = ra_max.index.name
+
+    return sub
 
 
 def fit_multi_exp(x: np.ndarray, y: np.ndarray, n_exp: int = 1, p0=None, bounds=(0, np.inf)):
@@ -129,12 +164,11 @@ def plot_tid_full_and_closeup(
 ):
     """
     Plots a 2-column comparison of the single-channel TID PDF:
-- Left:  Full inter-arrival time distribution
-- Right: Close-up up to x_max = 3 * (tau_1 + tau_2) with right-aligned y-axis
+    - Left:  Full inter-arrival time distribution (bounded by max TID interval)
+    - Right: Close-up up to x_max = 3 * (tau_1 + tau_2) with right-aligned y-axis
     """
     popt = np.asarray(popt, dtype=float)
 
-    # 1. Prepare empirical DataFrame
     if isinstance(tid_, pd.Series):
         df = pd.DataFrame({
             "interval": tid_.index.to_numpy(dtype=float),
@@ -162,7 +196,6 @@ def plot_tid_full_and_closeup(
     total_counts = df["time_interval_distribution"].sum()
     df["pdf"] = df["time_interval_distribution"] / (total_counts * dt_emp)
 
-    # 2. Run Monte Carlo simulation once for both panels (cap duration to avoid MemoryError)
     if duration is None:
         duration = max(total_counts / popt[0], 1.0)
 
@@ -179,7 +212,6 @@ def plot_tid_full_and_closeup(
     bin_edges = np.arange(0, intervals.max() + bin_width, bin_width)
     counts, edges = np.histogram(intervals, bins=bin_edges, density=True)
 
-    # 3. Create 1x2 subplots (independent x and y axes)
     created_fig = axes is None
     if created_fig:
         fig, axes = plt.subplots(
@@ -191,9 +223,9 @@ def plot_tid_full_and_closeup(
         )
     ax_full, ax_zoom = axes
 
-    xlim_full = max(df["interval"].max(), intervals.max())
+    # Cut consistently at the maximum interval of the empirical TID (not the simulated/resampled max)
+    xlim_full = float(df["interval"].max())
 
-    # Helper to draw shared curves & dead-time markers on both axes
     def _plot_layers(ax, x_upper, n_grid):
         df_sub = df[df["interval"] <= x_upper]
         ax.step(
@@ -241,7 +273,6 @@ def plot_tid_full_and_closeup(
                 label=rf"$\tau_1 + \tau_2$ = {(popt[1] + popt[2])*1e6:.2f} $\mu$s",
             )
 
-    # --- Left Panel: Full Distribution ---
     _plot_layers(ax_full, xlim_full, n_grid=1000)
     ax_full.set_xlim(0, xlim_full)
     if logy_full:
@@ -252,7 +283,6 @@ def plot_tid_full_and_closeup(
     ax_full.legend(loc="upper right", frameon=True)
     ax_full.grid(True, alpha=0.25)
 
-    # --- Right Panel: Close-Up (y-axis on the right) ---
     _plot_layers(ax_zoom, xlim_closeup, n_grid=500)
     ax_zoom.set_xlim(0, xlim_closeup)
     ax_zoom.yaxis.tick_right()
@@ -264,7 +294,6 @@ def plot_tid_full_and_closeup(
     ax_zoom.set_title(rf"Dead-Time Close-Up ($0$ to ${tau_formula} = {xlim_closeup*1e6:.2f}\,\mu\mathrm{{s}}$)")
     ax_zoom.grid(True, alpha=0.25)
 
-    # Parameter box placed neatly in upper right of close-up (since legend is on the left)
     param_names = [r"\lambda", r"\tau_1", r"\tau_2"] if has_two_taus else [r"\lambda", r"\tau_1"]
     param_label = "\n".join(fr"${name}$ = {val:.3e}" for name, val in zip(param_names, popt))
     ax_zoom.text(
@@ -342,7 +371,6 @@ def plot_tid_closeup(
         label="Empirical",
     )
 
-    # 2. Run Monte Carlo simulation once for both panels (cap duration to avoid MemoryError)
     if duration is None:
         duration = max(total_counts / popt[0], 1.0)
 
@@ -433,20 +461,42 @@ def plot_rossi_alpha_fit(
     ch_tr: int,
     gate: float,
     min_interval: float,
+    rebin_width: float = 1e-6,
     ax=None,
 ):
-    """Plots empirical Rossi-alpha distribution alongside the multi-exponential fit."""
+    """Plots empirical Rossi-alpha distribution (rebinned to 1 us by default) alongside the multi-exponential fit."""
     created_fig = ax is None
     if created_fig:
         fig, ax = plt.subplots(dpi=200, figsize=(7, 3.5))
 
-    ax.plot(x_all * 1e6, y_all, color="steelblue", lw=1.0, alpha=0.8, label="Empirical Data")
+    x_all = np.asarray(x_all, dtype=float)
+    y_all = np.asarray(y_all, dtype=float)
+    x_fit = np.asarray(x_fit, dtype=float)
+    y_fit = np.asarray(y_fit, dtype=float)
+
+    dt_native = float(np.median(np.diff(x_all))) if len(x_all) > 1 else 0.0
+    if rebin_width is not None and dt_native > 0 and rebin_width > dt_native * 1.01:
+        factor = int(round(rebin_width / dt_native))
+        n_coarse = len(y_all) // factor
+        if n_coarse > 0:
+            x_plot = x_all[: n_coarse * factor].reshape(n_coarse, factor)[:, 0]
+            y_plot = y_all[: n_coarse * factor].reshape(n_coarse, factor).sum(axis=1)
+            y_fit_plot = y_fit * factor
+            bin_label = f"Empirical Data ({factor * dt_native * 1e6:.2g} $\\mu$s bins)"
+        else:
+            x_plot, y_plot, y_fit_plot = x_all, y_all, y_fit
+            bin_label = "Empirical Data"
+    else:
+        x_plot, y_plot, y_fit_plot = x_all, y_all, y_fit
+        bin_label = "Empirical Data"
+
+    ax.plot(x_plot * 1e6, y_plot, color="steelblue", lw=1.0, alpha=0.8, label=bin_label)
 
     alphas = [popt[2 + 2 * i] for i in range(n_exp)]
     alpha_str = ", ".join(f"{a:.2e}" for a in alphas)
     ax.plot(
         x_fit * 1e6,
-        y_fit,
+        y_fit_plot,
         color="crimson",
         lw=1.6,
         label=rf"Fit ($\alpha = {alpha_str}\ \mathrm{{s}}^{{-1}}$)",
@@ -484,8 +534,11 @@ def main(
     overwrite_h5: bool = False,
     bin_size_seconds: float = 0.1,
     min_duration: float = 10.0,
+    max_ticks: int = 20_000,
+    chunk_size: int = 500_000,
     n_exp: int = 1,
     rossi_min_interval: float = 50e-6,
+    rossi_plot_bin_us: float = 1.0,
 ) -> None:
     t_pipeline_start = time.perf_counter()
     print(f"[TIME] Numba threads available: {tsd.numba.get_num_threads()}")
@@ -501,8 +554,8 @@ def main(
     else:
         h5_path = in_path.with_suffix(".h5")
         if overwrite_h5 or not h5_path.exists():
-            print(f"[TIME] Step 1 (BIN -> HDF5 conversion): starting...")
-            tsd.convert_bin_to_hdf5(str(in_path), str(h5_path))
+            print("[TIME] Step 1 (BIN -> HDF5 conversion): starting...")
+            tsd.convert_bin_to_hdf5(str(in_path), str(h5_path), chunk_size=chunk_size)
             print(f"[TIME] Step 1 (BIN -> HDF5 conversion): {time.perf_counter() - t_step:.2f} s")
         else:
             print(f"[TIME] Step 1 (HDF5 already exists, skipped conversion): {time.perf_counter() - t_step:.2f} s — {h5_path}")
@@ -517,12 +570,16 @@ def main(
             print(f"\nProcessing channel {ch_id} ({len(ch_handle):,} events)...")
 
             t_cr = time.perf_counter()
-            cr_series = ch_handle.count_rate(bin_size_seconds=bin_size_seconds)
+            cr_series = ch_handle.count_rate(bin_size_seconds=bin_size_seconds, chunk_size=chunk_size)
             print(f"[TIME]   Ch {ch_id} count_rate: {time.perf_counter() - t_cr:.2f} s")
 
             t_tid = time.perf_counter()
-            tid_series = ch_handle.time_interval_distribution(max_delta_ticks=5000, coarser_grouping=1)
-            print(f"[TIME]   Ch {ch_id} time_interval_distribution: {time.perf_counter() - t_tid:.2f} s")
+            tid_series = ch_handle.time_interval_distribution(
+                max_delta_ticks=max_ticks,
+                coarser_grouping=1,
+                chunk_size=chunk_size,
+            )
+            print(f"[TIME]   Ch {ch_id} time_interval_distribution (max_ticks={max_ticks}, chunk_size={chunk_size:,}): {time.perf_counter() - t_tid:.2f} s")
 
             results[ch_id] = {
                 "countrate": cr_series,
@@ -647,42 +704,46 @@ def main(
     print(f"[TIME] Step 2B (All channels post-processing/fitting/plotting): {time.perf_counter() - t_step_b:.2f} s")
 
     # --------------------------------------------------------
-    # C. Rossi-Alpha Distribution Computation & Fitting
+    # C. Single-Pass Max-Gate Rossi-Alpha Computation & Fitting
     # --------------------------------------------------------
-    print("\n--- Computing Rossi-Alpha Distributions ---")
+    print("\n--- Computing Rossi-Alpha Distributions (Single-Pass Max Gate) ---")
     t_step_c = time.perf_counter()
     gates_sec = np.array([10, 50, 100, 200, 500, 1000, 2000, 5000, 10000]) * 1e-6
+    max_gate = float(np.max(gates_sec))
     rossi = {}
 
+    channel_pairs = (
+        list(product(suitable_channels, repeat=2))
+        if len(suitable_channels) > 1
+        else [(suitable_channels[0], suitable_channels[0])]
+    )
+
     with tsd.HDF5TimestampData(str(h5_path)) as data:
-        if len(suitable_channels) > 1:
-            for ch_id, ch_tr in product(suitable_channels, repeat=2):
-                t_pair = time.perf_counter()
-                print(f"Computing Rossi-alpha: signal Ch {ch_id}, trigger Ch {ch_tr}...")
-                data_id = data.channels[ch_id]
-                for g in gates_sec:
-                    t_g = time.perf_counter()
-                    if ch_id == ch_tr:
-                        rossi[(g, ch_id, ch_tr)] = data_id.rossi_alpha(
-                            h5_trigger=None, gate=g, coarser_grouping=1
-                        )
-                    else:
-                        data_tr = data.channels[ch_tr]
-                        rossi[(g, ch_id, ch_tr)] = data_id.rossi_alpha(
-                            h5_trigger=data_tr, gate=g, coarser_grouping=1
-                        )
-                    print(f"[TIME]     gate={g*1e6:.0f} us (sig={ch_id}, trig={ch_tr}): {time.perf_counter() - t_g:.2f} s")
-                print(f"[TIME]   Pair (sig={ch_id}, trig={ch_tr}) all gates: {time.perf_counter() - t_pair:.2f} s")
-        else:
-            only_ch = suitable_channels[0]
-            print(f"Computing Rossi-alpha (auto-correlation) for Ch {only_ch}...")
-            data_id = data.channels[only_ch]
+        for ch_id, ch_tr in channel_pairs:
+            t_pair = time.perf_counter()
+            print(
+                f"Computing max-gate Rossi-alpha ({max_gate * 1e6:.0f} us): "
+                f"signal Ch {ch_id}, trigger Ch {ch_tr}..."
+            )
+            data_id = data.channels[ch_id]
+            trig_handle = None if ch_id == ch_tr else data.channels[ch_tr]
+
+            ra_full = data_id.rossi_alpha(
+                h5_trigger=trig_handle,
+                gate=max_gate,
+                coarser_grouping=1,
+                chunk_size=chunk_size,
+            )
+
             for g in gates_sec:
-                t_g = time.perf_counter()
-                rossi[(g, only_ch, only_ch)] = data_id.rossi_alpha(
-                    h5_trigger=None, gate=g, coarser_grouping=1
+                rossi[(float(g), ch_id, ch_tr)] = slice_rossi_gate(
+                    ra_full, gate_sec=float(g), coarser_grouping=1
                 )
-                print(f"[TIME]     gate={g*1e6:.0f} us (ch={only_ch}): {time.perf_counter() - t_g:.2f} s")
+
+            print(
+                f"[TIME]   Pair (sig={ch_id}, trig={ch_tr}) max-gate + {len(gates_sec)} slices: "
+                f"{time.perf_counter() - t_pair:.2f} s"
+            )
 
     print(f"[TIME] Step 2C-1 (All Rossi-Alpha computations): {time.perf_counter() - t_step_c:.2f} s")
 
@@ -691,7 +752,7 @@ def main(
         pickle.dump(rossi, f)
     print(f"[TIME] Saving rossialpha_data.pkl: {time.perf_counter() - t_pkl:.2f} s")
 
-    # Fit and plot each Rossi-alpha distribution
+    # Fit (native resolution) and plot (rebinned to `rossi_plot_bin_us`) each Rossi-alpha distribution
     print("Fitting and plotting Rossi-alpha distributions...")
     t_fit_plot = time.perf_counter()
     rossi_plots_dir = out_path / "rossi_alpha_plots"
@@ -699,9 +760,13 @@ def main(
 
     fit_results = {}
     fit_summary_rows = []
+    rebin_width_sec = rossi_plot_bin_us * 1e-6 if rossi_plot_bin_us and rossi_plot_bin_us > 0 else None
 
     for (g, ch_id, ch_tr), rossi_raw in rossi.items():
-        df_rossi = rossi_raw.reset_index() if "interval" not in rossi_raw.columns else rossi_raw.copy()
+        if isinstance(rossi_raw, pd.Series):
+            df_rossi = rossi_raw.to_frame(name="rossi_alpha_distribution").reset_index(names="interval")
+        else:
+            df_rossi = rossi_raw.reset_index() if "interval" not in rossi_raw.columns else rossi_raw.copy()
 
         # Ensure interval is in seconds (convert if stored in 10 ns ticks)
         if df_rossi["interval"].max() > 1.0:
@@ -762,8 +827,10 @@ def main(
             ch_tr=ch_tr,
             gate=g,
             min_interval=rossi_min_interval,
+            rebin_width=rebin_width_sec,
             ax=ax_ra,
         )
+        ax_ra.set_xlim( 0, max(df_rossi["interval"].max(), x_fit_data.max()) * 1.05)
         fig_ra.tight_layout()
         plot_name = f"rossi_alpha_ch{ch_id}_tr{ch_tr}_g{int(round(g * 1e6))}us.png"
         fig_ra.savefig(rossi_plots_dir / plot_name, bbox_inches="tight")
@@ -830,6 +897,18 @@ def parse_args():
         help="Minimum channel recording duration in seconds to process (default: 10.0).",
     )
     parser.add_argument(
+        "--max-ticks",
+        type=int,
+        default=20_000,
+        help="Maximum inter-arrival time interval in ticks for time_interval_distribution (default: 20000).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500_000,
+        help="Number of events per processing chunk for conversion and HDF5 analysis (default: 500000).",
+    )
+    parser.add_argument(
         "--n-exp",
         type=int,
         default=1,
@@ -841,13 +920,17 @@ def parse_args():
         default=50e-6,
         help="Lower time cutoff in seconds for Rossi-alpha fitting to exclude dead-time distortion (default: 50e-6).",
     )
+    parser.add_argument(
+        "--rossi-plot-bin-us",
+        type=float,
+        default=1.0,
+        help="Visualization bin width in microseconds for Rossi-alpha plots (default: 1.0; set <=0 for native bins).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.lib_dir:
-        sys.path.insert(0, str(Path(args.lib_dir).expanduser().resolve()))
     main(
         file_in=args.file_in,
         dt_structure=args.dt_structure,
@@ -855,6 +938,9 @@ if __name__ == "__main__":
         overwrite_h5=args.overwrite,
         bin_size_seconds=args.bin_size,
         min_duration=args.min_duration,
+        max_ticks=args.max_ticks,
+        chunk_size=args.chunk_size,
         n_exp=args.n_exp,
         rossi_min_interval=args.rossi_min_interval,
+        rossi_plot_bin_us=args.rossi_plot_bin_us,
     )
