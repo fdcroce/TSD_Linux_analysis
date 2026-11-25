@@ -22,6 +22,94 @@ def generate_poisson_events(rate: float, duration: float, rng=None) -> np.ndarra
     return timestamps[timestamps <= duration]
 
 
+def generate_rossi_alpha_events(
+    total_rate: float,
+    duration: float,
+    rossi_alpha: float,
+    chain_fraction: float = 0.3,
+    events_per_chain: float = 3.0,
+    background_rate: float | None = None,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """
+    Generate arrival timestamps with Rossi-alpha correlated fission bursts.
+
+    Each correlated burst starts at a Poisson trigger time and spawns
+    `events_per_chain` correlated events whose offsets after the trigger
+    follow an exponential distribution with decay rate `rossi_alpha` (1/s).
+
+    Parameters
+    ----------
+    total_rate : float
+        Target overall event rate (events/s) used when `background_rate` is None.
+    duration : float
+        Simulation window length in seconds.
+    rossi_alpha : float
+        Rossi-alpha decay constant alpha in s^-1 (must be > 0).
+    chain_fraction : float
+        Approximate fraction of total events belonging to correlated chains in [0, 1).
+    events_per_chain : float
+        Mean number of correlated events per chain trigger (> 0).
+    background_rate : float, optional
+        Explicit uncorrelated Poisson background rate (events/s). If None, it is
+        inferred from `total_rate * (1 - chain_fraction)`.
+    rng : np.random.Generator, optional
+        NumPy random generator instance.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted 1D array of event timestamps in [0, duration].
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if duration <= 0:
+        return np.array([], dtype=float)
+    if rossi_alpha <= 0:
+        raise ValueError("rossi_alpha must be positive.")
+    if not (0.0 <= chain_fraction < 1.0):
+        raise ValueError("chain_fraction must be in [0, 1).")
+    if events_per_chain <= 0:
+        raise ValueError("events_per_chain must be positive.")
+
+    if background_rate is None:
+        bg_rate = total_rate * (1.0 - chain_fraction)
+        correlated_rate = total_rate * chain_fraction
+    else:
+        bg_rate = max(0.0, float(background_rate))
+        correlated_rate = max(0.0, float(total_rate) - bg_rate)
+
+    parts: list[np.ndarray] = []
+
+    # 1. Uncorrelated (Poisson) background events
+    if bg_rate > 0:
+        bg_events = generate_poisson_events(bg_rate, duration, rng=rng)
+        if bg_events.size > 0:
+            parts.append(bg_events)
+
+    # 2. Correlated fission-chain triggers + exponentially delayed events (~ exp(-alpha * dt))
+    trigger_rate = correlated_rate / events_per_chain
+    if trigger_rate > 0:
+        triggers = generate_poisson_events(trigger_rate, duration, rng=rng)
+        if triggers.size > 0:
+            # Draw number of correlated events per trigger (Poisson around events_per_chain)
+            counts = rng.poisson(lam=events_per_chain, size=triggers.size)
+            valid = counts > 0
+            if np.any(valid):
+                t_valid = triggers[valid]
+                c_valid = counts[valid]
+                repeated_triggers = np.repeat(t_valid, c_valid)
+                delays = rng.exponential(scale=1.0 / rossi_alpha, size=repeated_triggers.size)
+                chain_events = repeated_triggers + delays
+                chain_events = chain_events[chain_events <= duration]
+                if chain_events.size > 0:
+                    parts.append(chain_events)
+
+    if not parts:
+        return np.array([], dtype=float)
+
+    return np.sort(np.concatenate(parts))
+
 def apply_non_paralyzable(timestamps: np.ndarray, tau: float) -> np.ndarray:
     """Non-paralyzable (NE) dead-time filter."""
     if len(timestamps) == 0 or tau <= 0:
@@ -36,11 +124,18 @@ def apply_non_paralyzable(timestamps: np.ndarray, tau: float) -> np.ndarray:
 
 
 def apply_paralyzable(timestamps: np.ndarray, tau: float) -> np.ndarray:
-    """Paralyzable (E) dead-time filter."""
+    """Paralyzable (extendable / E) dead-time filter."""
     if len(timestamps) == 0 or tau <= 0:
         return timestamps.copy()
-    dt = np.diff(timestamps, prepend=-np.inf)
-    return timestamps[dt >= tau]
+    ts = np.sort(timestamps)
+    accepted = []
+    dead_until = -np.inf
+    for t in ts:
+        if t >= dead_until:
+            accepted.append(t)
+        # Every arriving event extends dead time
+        dead_until = t + tau
+    return np.array(accepted, dtype=float)
 
 
 # =====================================================================
